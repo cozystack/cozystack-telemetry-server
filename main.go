@@ -188,7 +188,7 @@ func handleTelemetry(w http.ResponseWriter, r *http.Request, geoIP *GeoIPReader,
 		return
 	}
 
-	sourceIP := extractIP(r.RemoteAddr)
+	sourceIP := extractIPFromRequest(r)
 	log.Printf("Received metrics from %s for cluster %s", sourceIP, clusterID)
 
 	enrichedMetrics, err := enrichMetrics(body, sourceIP, clusterID, geoIP)
@@ -206,6 +206,23 @@ func handleTelemetry(w http.ResponseWriter, r *http.Request, geoIP *GeoIPReader,
 
 	log.Printf("Request from cluster %s processed in %v", clusterID, time.Since(startTime))
 	w.WriteHeader(http.StatusOK)
+}
+
+func extractIPFromRequest(r *http.Request) string {
+	cfConnectingIP := r.Header.Get("CF-Connecting-IP")
+	if cfConnectingIP != "" {
+		return cfConnectingIP
+	}
+
+	xForwardedFor := r.Header.Get("X-Forwarded-For")
+	if xForwardedFor != "" {
+		ips := strings.Split(xForwardedFor, ",")
+		if len(ips) > 0 && ips[0] != "" {
+			return strings.TrimSpace(ips[0])
+		}
+	}
+
+	return extractIP(r.RemoteAddr)
 }
 
 func main() {
