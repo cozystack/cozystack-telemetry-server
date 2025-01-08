@@ -1,0 +1,20 @@
+apiVersion: grafana.integreatly.org/v1beta1
+kind: GrafanaDatasource
+metadata:
+  name: cozy-telemetry
+  namespace: tenant-root
+spec:
+  datasource:
+    access: proxy
+    editable: true
+    isDefault: true
+    jsonData:
+      timeInterval: 15m
+      tlsSkipVerify: true
+    name: cozy-telemetry
+    type: prometheus
+    url: http://vmselect-cozy-telemetry.cozy-telemetry.svc:8481/select/0/prometheus/
+  instanceSelector:
+    matchLabels:
+      dashboards: grafana
+  resyncPeriod: 5m

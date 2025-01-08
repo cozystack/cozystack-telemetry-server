@@ -1,0 +1,34 @@
+replicaCount: 2
+
+image:
+  repository: "ghcr.io/aenix-io/cozystack-telemetry-server"
+  tag: "v1.0.0"
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 8081
+
+# Helm chart allows customizing these arguments
+config:
+  forwardURL: "http://vminsert-cozy-telemetry:8480/insert/0/prometheus/api/v1/import/prometheus"
+  geoipDB: "/GeoLite2-Country.mmdb"
+  listenAddr: ":8081"
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+# Ingress spec
+ingress:
+  enabled: true
+  annotations:
+    acme.cert-manager.io/http01-ingress-class: tenant-root
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+  host: "telemetry.cozystack.io"
+  ingressClassName: "tenant-root"
+  tlsSecretName: "cozy-telemetry-tls"

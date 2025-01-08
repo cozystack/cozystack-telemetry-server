@@ -1,0 +1,38 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cozy-telemetry
+  labels:
+    app: cozy-telemetry
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: cozy-telemetry
+  template:
+    metadata:
+      labels:
+        app: cozy-telemetry
+    spec:
+      containers:
+      - name: cozy-telemetry
+        image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+        imagePullPolicy: {{ .Values.image.pullPolicy }}
+        args:
+          - "--geoip-db={{ .Values.config.geoipDB }}"
+          - "--forward-url={{ .Values.config.forwardURL }}"
+          - "--listen-addr={{ .Values.config.listenAddr }}"
+        ports:
+        - containerPort: {{ .Values.service.port }}
+        resources:
+          {{- toYaml .Values.resources | nindent 10 }}
+        readinessProbe:
+          tcpSocket:
+            port: 8081
+          initialDelaySeconds: 15
+          periodSeconds: 10
+        livenessProbe:
+          tcpSocket:
+            port: 8081
+          initialDelaySeconds: 15
+          periodSeconds: 10

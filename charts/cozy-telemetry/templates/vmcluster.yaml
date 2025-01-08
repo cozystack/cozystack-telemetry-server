@@ -1,0 +1,47 @@
+---
+apiVersion: operator.victoriametrics.com/v1beta1
+kind: VMCluster
+metadata:
+  name: cozy-telemetry
+  namespace: cozy-telemetry
+  annotations:
+    helm.sh/resource-policy: keep
+spec:
+  replicationFactor: 2
+  retentionPeriod: "3"
+  vminsert:
+    replicaCount: 2
+    resources: {}
+  vmselect:
+    replicaCount: 2
+    resources:
+      limits:
+        memory: 1000Mi
+      requests:
+        cpu: 100m
+        memory: 500Mi
+    extraArgs:
+      search.maxUniqueTimeseries: "600000"
+      dedup.minScrapeInterval: "15s"
+    cacheMountPath: /select-cache
+    storage:
+      volumeClaimTemplate:
+        spec:
+          resources:
+            requests:
+              storage: 2Gi
+  vmstorage:
+    replicaCount: 2
+    resources:
+      limits:
+        memory: 1000Mi
+      requests:
+        cpu: 100m
+        memory: 500Mi
+    storage:
+      volumeClaimTemplate:
+        spec:
+          resources:
+            requests:
+              storage: 20Gi
+    storageDataPath: /vm-data
