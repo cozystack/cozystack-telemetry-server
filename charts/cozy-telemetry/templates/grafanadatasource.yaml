@@ -7,7 +7,6 @@ spec:
   datasource:
     access: proxy
     editable: true
-    isDefault: true
     jsonData:
       timeInterval: 15m
       tlsSkipVerify: true
