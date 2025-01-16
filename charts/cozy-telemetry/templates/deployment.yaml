@@ -19,7 +19,6 @@ spec:
         image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
         imagePullPolicy: {{ .Values.image.pullPolicy }}
         args:
-          - "--geoip-db={{ .Values.config.geoipDB }}"
           - "--forward-url={{ .Values.config.forwardURL }}"
           - "--listen-addr={{ .Values.config.listenAddr }}"
         ports:

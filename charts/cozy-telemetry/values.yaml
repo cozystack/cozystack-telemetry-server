@@ -2,7 +2,7 @@ replicaCount: 2
 
 image:
   repository: "ghcr.io/aenix-io/cozystack-telemetry-server"
-  tag: "v1.0.1"
+  tag: "v1.1.0"
   pullPolicy: IfNotPresent
 
 service:
@@ -12,7 +12,6 @@ service:
 # Helm chart allows customizing these arguments
 config:
   forwardURL: "http://vminsert-cozy-telemetry:8480/insert/0/prometheus/api/v1/import/prometheus"
-  geoipDB: "/GeoLite2-Country.mmdb"
   listenAddr: ":8081"
 
 resources:

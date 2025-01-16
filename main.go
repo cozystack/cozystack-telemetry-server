@@ -6,75 +6,21 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"sort"
 	"strings"
 	"time"
 
-	"github.com/oschwald/geoip2-golang"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/textparse"
 )
 
-// GeoIPReader wraps the GeoIP2 database reader
-type GeoIPReader struct {
-	reader *geoip2.Reader
-}
-
-// NewGeoIPReader creates a new GeoIP reader instance
-func NewGeoIPReader(dbPath string) (*GeoIPReader, error) {
-	reader, err := geoip2.Open(dbPath)
-	if err != nil {
-		return nil, fmt.Errorf("error opening GeoIP database: %v", err)
-	}
-	return &GeoIPReader{reader: reader}, nil
-}
-
-// Close closes the GeoIP reader
-func (g *GeoIPReader) Close() {
-	if g.reader != nil {
-		g.reader.Close()
-	}
-}
-
-// GetCountry returns the country code for an IP address
-func (g *GeoIPReader) GetCountry(ipStr string) string {
-	ip := net.ParseIP(ipStr)
-	if ip == nil {
-		return "unknown"
-	}
-
-	record, err := g.reader.Country(ip)
-	if err != nil {
-		log.Printf("Error getting country for IP %s: %v", ipStr, err)
-		return "unknown"
-	}
-
-	return record.Country.IsoCode
-}
-
-func extractIP(addr string) string {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		return addr
-	}
-
-	ip := net.ParseIP(host)
-	if ip == nil {
-		return host
-	}
-
-	return ip.String()
-}
-
-func enrichMetrics(input []byte, sourceIP string, clusterID string, geoIP *GeoIPReader) ([]byte, error) {
+func enrichMetrics(input []byte, clusterID string) ([]byte, error) {
 	symbolTable := labels.NewSymbolTable()
 	parser := textparse.NewPromParser(input, symbolTable)
 	var builder bytes.Buffer
 
 	metricsCount := 0
-	country := geoIP.GetCountry(sourceIP)
 
 	for {
 		entry, err := parser.Next()
@@ -100,19 +46,11 @@ func enrichMetrics(input []byte, sourceIP string, clusterID string, geoIP *GeoIP
 			var lbls labels.Labels
 			parser.Metric(&lbls)
 
-			// Add source_ip, cluster_id and country_code to the labels
+			// Add cluster_id to the labels
 			lbls = append(lbls,
-				labels.Label{
-					Name:  "source_ip",
-					Value: sourceIP,
-				},
 				labels.Label{
 					Name:  "cluster_id",
 					Value: clusterID,
-				},
-				labels.Label{
-					Name:  "country_code",
-					Value: country,
 				},
 			)
 
@@ -143,7 +81,7 @@ func enrichMetrics(input []byte, sourceIP string, clusterID string, geoIP *GeoIP
 		}
 	}
 
-	log.Printf("Processed %d metrics for cluster %s from %s (%s)", metricsCount, clusterID, sourceIP, country)
+	log.Printf("Processed %d metrics for cluster %s", metricsCount, clusterID)
 	return builder.Bytes(), nil
 }
 
@@ -165,7 +103,7 @@ func forwardToPrometheus(metrics []byte, forwardURL string) error {
 	return nil
 }
 
-func handleTelemetry(w http.ResponseWriter, r *http.Request, geoIP *GeoIPReader, forwardURL string) {
+func handleTelemetry(w http.ResponseWriter, r *http.Request, forwardURL string) {
 	startTime := time.Now()
 
 	if r.Method != http.MethodPost {
@@ -188,10 +126,9 @@ func handleTelemetry(w http.ResponseWriter, r *http.Request, geoIP *GeoIPReader,
 		return
 	}
 
-	sourceIP := extractIPFromRequest(r)
-	log.Printf("Received metrics from %s for cluster %s", sourceIP, clusterID)
+	log.Printf("Received metrics for cluster %s", clusterID)
 
-	enrichedMetrics, err := enrichMetrics(body, sourceIP, clusterID, geoIP)
+	enrichedMetrics, err := enrichMetrics(body, clusterID)
 	if err != nil {
 		log.Printf("Error processing metrics for cluster %s: %v", clusterID, err)
 		http.Error(w, fmt.Sprintf("Error processing metrics: %v", err), http.StatusBadRequest)
@@ -208,36 +145,11 @@ func handleTelemetry(w http.ResponseWriter, r *http.Request, geoIP *GeoIPReader,
 	w.WriteHeader(http.StatusOK)
 }
 
-func extractIPFromRequest(r *http.Request) string {
-	cfConnectingIP := r.Header.Get("CF-Connecting-IP")
-	if cfConnectingIP != "" {
-		return cfConnectingIP
-	}
-
-	xForwardedFor := r.Header.Get("X-Forwarded-For")
-	if xForwardedFor != "" {
-		ips := strings.Split(xForwardedFor, ",")
-		if len(ips) > 0 && ips[0] != "" {
-			return strings.TrimSpace(ips[0])
-		}
-	}
-
-	return extractIP(r.RemoteAddr)
-}
-
 func main() {
 	// Define flags
-	geoipDBPath := flag.String("geoip-db", "/GeoLite2-Country.mmdb", "Path to GeoLite2 Country database")
 	forwardURL := flag.String("forward-url", "http://vminsert-cozy-telemetry:8480/insert/0/prometheus/api/v1/import/prometheus", "URL to forward the metrics to")
 	listenAddr := flag.String("listen-addr", ":8081", "Address to listen on for incoming metrics")
 	flag.Parse()
-
-	// Initialize GeoIP
-	geoIP, err := NewGeoIPReader(*geoipDBPath)
-	if err != nil {
-		log.Fatalf("Failed to initialize GeoIP database: %v", err)
-	}
-	defer geoIP.Close()
 
 	server := &http.Server{
 		Addr:         *listenAddr,
@@ -246,12 +158,11 @@ func main() {
 	}
 
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		handleTelemetry(w, r, geoIP, *forwardURL)
+		handleTelemetry(w, r, *forwardURL)
 	})
 
 	log.Printf("Starting server on %s", *listenAddr)
 	log.Printf("Forwarding metrics to %s", *forwardURL)
-	log.Printf("Using GeoIP database at %s", *geoipDBPath)
 
 	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("Server error: %v", err)
