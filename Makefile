@@ -8,4 +8,4 @@ delete:
 	helm uninstall cozy-telemetry -n cozy-telemetry
 
 image:
-	docker build . -t ghcr.io/aenix-io/cozystack-telemetry-server:latest
+	docker build . -t ghcr.io/cozystack/cozystack-telemetry-server:latest
