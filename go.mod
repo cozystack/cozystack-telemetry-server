@@ -1,4 +1,4 @@
-module github.com/aenix-io/cozystack-telemetry-server
+module github.com/cozystack/cozystack-telemetry-server
 
 go 1.23.4
 
