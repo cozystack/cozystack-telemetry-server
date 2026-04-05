@@ -486,14 +486,14 @@ func aggregateSnapshots(snapshots []Snapshot, avg bool) PeriodStats {
 
 	if len(snapshots) == 1 {
 		stats.Label = latestDate.Format("January 2006")
-		stats.Start = latestDate.Format("2006-01-01")
+		stats.Start = latestDate.Format("2006-01-02")
 		endOfMonth := latestDate.AddDate(0, 1, -1)
 		stats.End = endOfMonth.Format("2006-01-02")
 	} else {
 		stats.Label = fmt.Sprintf("%s \u2014 %s",
 			oldestDate.Format("January 2006"),
 			latestDate.Format("January 2006"))
-		stats.Start = oldestDate.Format("2006-01-01")
+		stats.Start = oldestDate.Format("2006-01-02")
 		endOfMonth := latestDate.AddDate(0, 1, -1)
 		stats.End = endOfMonth.Format("2006-01-02")
 	}
@@ -544,7 +544,7 @@ func aggregateSnapshots(snapshots []Snapshot, avg bool) PeriodStats {
 
 // parseMonth parses "2006-01" into a time.Time for the 1st of that month.
 func parseMonth(month string) time.Time {
-	t, err := time.Parse("2006-01", month)
+	t, err := time.Parse("2006-01-02", month+"-01")
 	if err != nil {
 		return time.Now()
 	}
