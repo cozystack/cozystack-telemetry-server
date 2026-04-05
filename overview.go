@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	_ "time/tzdata" // embed timezone database for minimal container images
 )
 
 // Snapshot represents a monthly telemetry snapshot.
@@ -68,6 +69,7 @@ type githubContent struct {
 type OverviewManager struct {
 	vmSelectURL string
 	snapshotDir string
+	httpClient  *http.Client
 	mu          sync.RWMutex
 	snapshots   []Snapshot
 }
@@ -77,6 +79,7 @@ func NewOverviewManager(vmSelectURL, snapshotDir string) *OverviewManager {
 	return &OverviewManager{
 		vmSelectURL: vmSelectURL,
 		snapshotDir: snapshotDir,
+		httpClient:  &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
@@ -220,6 +223,12 @@ func (m *OverviewManager) collectSnapshot(monthLabel string) {
 		}
 	}
 
+	// Skip saving if no meaningful data was collected (e.g. VictoriaMetrics was unreachable)
+	if snapshot.Clusters == 0 && snapshot.TotalNodes == 0 && snapshot.TotalTenants == 0 {
+		log.Printf("Snapshot for %s has no data (all zeros), skipping save to avoid overwriting valid data", monthLabel)
+		return
+	}
+
 	// Save snapshot
 	m.saveSnapshot(snapshot)
 	log.Printf("Snapshot for %s collected: %d clusters, %d nodes, %d tenants, %d app types",
@@ -249,8 +258,7 @@ func (m *OverviewManager) queryVector(query string) ([]vectorResult, error) {
 		strings.TrimRight(m.vmSelectURL, "/"),
 		url.QueryEscape(query))
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Get(queryURL)
+	resp, err := m.httpClient.Get(queryURL)
 	if err != nil {
 		return nil, fmt.Errorf("VM query error: %v", err)
 	}
@@ -295,7 +303,6 @@ func (m *OverviewManager) queryVector(query string) ([]vectorResult, error) {
 // fetchAppList fetches the list of apps from the cozystack GitHub repository.
 func (m *OverviewManager) fetchAppList() []string {
 	apiURL := "https://api.github.com/repos/cozystack/cozystack/contents/packages/apps"
-	client := &http.Client{Timeout: 15 * time.Second}
 
 	req, err := http.NewRequest("GET", apiURL, nil)
 	if err != nil {
@@ -304,7 +311,7 @@ func (m *OverviewManager) fetchAppList() []string {
 	}
 	req.Header.Set("Accept", "application/vnd.github.v3+json")
 
-	resp, err := client.Do(req)
+	resp, err := m.httpClient.Do(req)
 	if err != nil {
 		log.Printf("Error fetching app list from GitHub: %v", err)
 		return defaultAppList()
@@ -441,7 +448,9 @@ func (m *OverviewManager) HandleOverview(w http.ResponseWriter, r *http.Request)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Access-Control-Allow-Origin", "*")
-	json.NewEncoder(w).Encode(overview)
+	if err := json.NewEncoder(w).Encode(overview); err != nil {
+		log.Printf("Error encoding overview response: %v", err)
+	}
 }
 
 // buildOverview constructs the overview response from stored snapshots.
@@ -546,6 +555,7 @@ func aggregateSnapshots(snapshots []Snapshot, avg bool) PeriodStats {
 func parseMonth(month string) time.Time {
 	t, err := time.Parse("2006-01-02", month+"-01")
 	if err != nil {
+		log.Printf("Warning: failed to parse month %q: %v, falling back to current time", month, err)
 		return time.Now()
 	}
 	return t
