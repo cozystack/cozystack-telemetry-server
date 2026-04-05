@@ -140,12 +140,16 @@ func (m *OverviewManager) scheduleMonthly() {
 	}
 }
 
-// nextFirstOfMonth returns the next 1st of month at 00:01 Pacific Time.
+// nextFirstOfMonth returns the next 1st-of-month at 00:01 Pacific Time.
+// If the current time is on the 1st but before 00:01, it returns today's 00:01
+// so the previous month's snapshot is not missed.
 func nextFirstOfMonth(now time.Time) time.Time {
-	year, month, _ := now.Date()
-	// Next month's 1st at 00:01
-	nextMonth := time.Date(year, month+1, 1, 0, 1, 0, 0, now.Location())
-	return nextMonth
+	year, month, day := now.Date()
+	currentMonthRun := time.Date(year, month, 1, 0, 1, 0, 0, now.Location())
+	if day == 1 && now.Before(currentMonthRun) {
+		return currentMonthRun
+	}
+	return time.Date(year, month+1, 1, 0, 1, 0, 0, now.Location())
 }
 
 // pacificLocation returns the US Pacific timezone.
@@ -364,8 +368,32 @@ func (m *OverviewManager) saveSnapshot(s Snapshot) {
 	}
 
 	filename := filepath.Join(m.snapshotDir, s.Month+".json")
-	if err := os.WriteFile(filename, data, 0644); err != nil {
-		log.Printf("Error writing snapshot to %s: %v", filename, err)
+
+	// Atomic write: temp file + rename to prevent partial files on crash
+	tmpFile, err := os.CreateTemp(m.snapshotDir, s.Month+".*.tmp")
+	if err != nil {
+		log.Printf("Error creating temp snapshot for %s: %v", filename, err)
+		return
+	}
+	tmpName := tmpFile.Name()
+	defer os.Remove(tmpName) // clean up on any failure path
+
+	if _, err := tmpFile.Write(data); err != nil {
+		tmpFile.Close()
+		log.Printf("Error writing temp snapshot %s: %v", tmpName, err)
+		return
+	}
+	if err := tmpFile.Sync(); err != nil {
+		tmpFile.Close()
+		log.Printf("Error syncing temp snapshot %s: %v", tmpName, err)
+		return
+	}
+	if err := tmpFile.Close(); err != nil {
+		log.Printf("Error closing temp snapshot %s: %v", tmpName, err)
+		return
+	}
+	if err := os.Rename(tmpName, filename); err != nil {
+		log.Printf("Error replacing snapshot %s: %v", filename, err)
 		return
 	}
 
@@ -463,15 +491,33 @@ func (m *OverviewManager) buildOverview(snapshots []Snapshot) OverviewResponse {
 	// Month: latest snapshot
 	resp.Periods["month"] = aggregateSnapshots(snapshots[:1], false)
 
-	// Quarter: last 3 months
-	quarterCount := min(3, len(snapshots))
-	resp.Periods["quarter"] = aggregateSnapshots(snapshots[:quarterCount], true)
+	// Quarter: last 3 calendar months
+	resp.Periods["quarter"] = aggregateSnapshots(filterSnapshotsByMonths(snapshots, 3), true)
 
-	// Year: last 12 months
-	yearCount := min(12, len(snapshots))
-	resp.Periods["year"] = aggregateSnapshots(snapshots[:yearCount], true)
+	// Year: last 12 calendar months
+	resp.Periods["year"] = aggregateSnapshots(filterSnapshotsByMonths(snapshots, 12), true)
 
 	return resp
+}
+
+// filterSnapshotsByMonths returns snapshots within the last N calendar months
+// relative to the latest snapshot. This ensures correct ranges even with gaps.
+func filterSnapshotsByMonths(snapshots []Snapshot, months int) []Snapshot {
+	if len(snapshots) == 0 {
+		return nil
+	}
+
+	latest := parseMonth(snapshots[0].Month)
+	cutoff := latest.AddDate(0, -(months - 1), 0)
+
+	var filtered []Snapshot
+	for _, s := range snapshots {
+		m := parseMonth(s.Month)
+		if !m.Before(cutoff) {
+			filtered = append(filtered, s)
+		}
+	}
+	return filtered
 }
 
 // aggregateSnapshots computes stats from a list of snapshots.
