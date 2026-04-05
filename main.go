@@ -149,7 +149,13 @@ func main() {
 	// Define flags
 	forwardURL := flag.String("forward-url", "http://vminsert-cozy-telemetry:8480/insert/0/prometheus/api/v1/import/prometheus", "URL to forward the metrics to")
 	listenAddr := flag.String("listen-addr", ":8081", "Address to listen on for incoming metrics")
+	vmSelectURL := flag.String("vmselect-url", "http://vmselect-cozy-telemetry:8481", "VictoriaMetrics vmselect base URL for queries")
+	snapshotDir := flag.String("snapshot-dir", "/data/snapshots", "Directory to store monthly snapshots")
 	flag.Parse()
+
+	// Initialize overview manager
+	overview := NewOverviewManager(*vmSelectURL, *snapshotDir)
+	overview.Start()
 
 	server := &http.Server{
 		Addr:         *listenAddr,
@@ -157,12 +163,15 @@ func main() {
 		WriteTimeout: 10 * time.Second,
 	}
 
+	http.HandleFunc("/api/overview", overview.HandleOverview)
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		handleTelemetry(w, r, *forwardURL)
 	})
 
 	log.Printf("Starting server on %s", *listenAddr)
 	log.Printf("Forwarding metrics to %s", *forwardURL)
+	log.Printf("VictoriaMetrics select URL: %s", *vmSelectURL)
+	log.Printf("Snapshot directory: %s", *snapshotDir)
 
 	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("Server error: %v", err)

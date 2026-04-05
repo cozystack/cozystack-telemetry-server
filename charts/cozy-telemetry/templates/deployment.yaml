@@ -5,7 +5,9 @@ metadata:
   labels:
     app: cozy-telemetry
 spec:
-  replicas: {{ .Values.replicaCount }}
+  replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app: cozy-telemetry
@@ -21,10 +23,15 @@ spec:
         args:
           - "--forward-url={{ .Values.config.forwardURL }}"
           - "--listen-addr={{ .Values.config.listenAddr }}"
+          - "--vmselect-url={{ .Values.config.vmSelectURL }}"
+          - "--snapshot-dir={{ .Values.config.snapshotDir }}"
         ports:
         - containerPort: {{ .Values.service.port }}
         resources:
           {{- toYaml .Values.resources | nindent 10 }}
+        volumeMounts:
+        - name: snapshots
+          mountPath: /data/snapshots
         readinessProbe:
           tcpSocket:
             port: 8081
@@ -35,3 +42,7 @@ spec:
             port: 8081
           initialDelaySeconds: 15
           periodSeconds: 10
+      volumes:
+      - name: snapshots
+        persistentVolumeClaim:
+          claimName: cozy-telemetry-snapshots
