@@ -5,9 +5,7 @@ metadata:
   labels:
     app: cozy-telemetry
 spec:
-  replicas: 1
-  strategy:
-    type: Recreate
+  replicas: {{ .Values.replicaCount }}
   selector:
     matchLabels:
       app: cozy-telemetry
@@ -44,5 +42,4 @@ spec:
           periodSeconds: 10
       volumes:
       - name: snapshots
-        persistentVolumeClaim:
-          claimName: cozy-telemetry-snapshots
+        emptyDir: {}

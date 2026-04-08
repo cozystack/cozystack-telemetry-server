@@ -15,30 +15,29 @@ import (
 	"strings"
 	"sync"
 	"time"
-	_ "time/tzdata" // embed timezone database for minimal container images
 )
 
 // Snapshot represents a monthly telemetry snapshot.
 type Snapshot struct {
-	Month         string         `json:"month"`          // "2026-03"
-	CollectedAt   time.Time      `json:"collected_at"`
-	Clusters      int            `json:"clusters"`
-	TotalNodes    int            `json:"total_nodes"`
-	TotalTenants  int            `json:"total_tenants"`
-	Apps          map[string]int `json:"apps"`
+	Month        string         `json:"month"` // "2026-03"
+	CollectedAt  time.Time      `json:"collected_at"`
+	Clusters     int            `json:"clusters"`
+	TotalNodes   int            `json:"total_nodes"`
+	TotalTenants int            `json:"total_tenants"`
+	Apps         map[string]int `json:"apps"`
 }
 
 // PeriodStats represents aggregated statistics for a time period.
 type PeriodStats struct {
-	Label              string         `json:"label"`
-	Start              string         `json:"start"`
-	End                string         `json:"end"`
-	Clusters           int            `json:"clusters"`
-	TotalNodes         int            `json:"total_nodes"`
-	AvgNodesPerCluster float64        `json:"avg_nodes_per_cluster"`
-	TotalTenants       int            `json:"total_tenants"`
-	AvgTenantsPerCluster float64      `json:"avg_tenants_per_cluster"`
-	Apps               map[string]int `json:"apps"`
+	Label                string         `json:"label"`
+	Start                string         `json:"start"`
+	End                  string         `json:"end"`
+	Clusters             int            `json:"clusters"`
+	TotalNodes           int            `json:"total_nodes"`
+	AvgNodesPerCluster   float64        `json:"avg_nodes_per_cluster"`
+	TotalTenants         int            `json:"total_tenants"`
+	AvgTenantsPerCluster float64        `json:"avg_tenants_per_cluster"`
+	Apps                 map[string]int `json:"apps"`
 }
 
 // OverviewResponse is the JSON returned by /api/overview.
@@ -74,97 +73,69 @@ type OverviewManager struct {
 	snapshots   []Snapshot
 }
 
-// NewOverviewManager creates a new OverviewManager.
+// NewOverviewManager creates a new OverviewManager and loads any cached snapshots.
 func NewOverviewManager(vmSelectURL, snapshotDir string) *OverviewManager {
-	return &OverviewManager{
+	m := &OverviewManager{
 		vmSelectURL: vmSelectURL,
 		snapshotDir: snapshotDir,
 		httpClient:  &http.Client{Timeout: 30 * time.Second},
 	}
-}
-
-// Start loads existing snapshots and begins the monthly scheduler.
-// It also collects an initial snapshot if none exists for the current period.
-func (m *OverviewManager) Start() {
-	if err := os.MkdirAll(m.snapshotDir, 0755); err != nil {
-		log.Printf("Warning: cannot create snapshot dir %s: %v", m.snapshotDir, err)
+	if err := os.MkdirAll(snapshotDir, 0755); err != nil {
+		log.Printf("Warning: cannot create snapshot dir %s: %v", snapshotDir, err)
 	}
-
 	m.loadSnapshots()
-
-	// Collect initial snapshot in background
-	go func() {
-		// Small delay to let the server start and VictoriaMetrics become available
-		time.Sleep(30 * time.Second)
-		m.collectIfNeeded()
-	}()
-
-	go m.scheduleMonthly()
+	return m
 }
 
-// collectIfNeeded checks if a snapshot for the current or previous month exists,
-// and collects one if not.
-func (m *OverviewManager) collectIfNeeded() {
-	now := time.Now().In(pacificLocation())
-	currentMonth := now.Format("2006-01")
-
+// ensureSnapshot guarantees the snapshot for monthLabel is in memory.
+// It tries memory first, then disk cache, then generates it from VictoriaMetrics.
+func (m *OverviewManager) ensureSnapshot(monthLabel string) {
 	m.mu.RLock()
-	hasCurrentMonth := false
 	for _, s := range m.snapshots {
-		if s.Month == currentMonth {
-			hasCurrentMonth = true
-			break
+		if s.Month == monthLabel {
+			m.mu.RUnlock()
+			return
 		}
 	}
 	m.mu.RUnlock()
 
-	if !hasCurrentMonth {
-		log.Println("No snapshot for current month, collecting now...")
-		m.collectSnapshot(currentMonth)
+	// Try loading from disk cache (another replica may have written it)
+	filename := filepath.Join(m.snapshotDir, monthLabel+".json")
+	if data, err := os.ReadFile(filename); err == nil {
+		var s Snapshot
+		if json.Unmarshal(data, &s) == nil {
+			m.mu.Lock()
+			// Double-check under write lock
+			for _, existing := range m.snapshots {
+				if existing.Month == monthLabel {
+					m.mu.Unlock()
+					return
+				}
+			}
+			m.snapshots = append(m.snapshots, s)
+			sort.Slice(m.snapshots, func(i, j int) bool {
+				return m.snapshots[i].Month > m.snapshots[j].Month
+			})
+			m.mu.Unlock()
+			return
+		}
 	}
+
+	// Generate from VictoriaMetrics
+	m.collectSnapshot(monthLabel)
 }
 
-// scheduleMonthly runs the collection at 00:01 Pacific Time on the 1st of each month.
-func (m *OverviewManager) scheduleMonthly() {
-	for {
-		now := time.Now().In(pacificLocation())
-		next := nextFirstOfMonth(now)
-		sleepDuration := next.Sub(now)
-
-		log.Printf("Next snapshot collection scheduled at %s (in %s)", next.Format(time.RFC3339), sleepDuration)
-		time.Sleep(sleepDuration)
-
-		// On the 1st, we label the snapshot with the previous month
-		prevMonth := next.AddDate(0, -1, 0).Format("2006-01")
-		m.collectSnapshot(prevMonth)
-	}
-}
-
-// nextFirstOfMonth returns the next 1st-of-month at 00:01 Pacific Time.
-// If the current time is on the 1st but before 00:01, it returns today's 00:01
-// so the previous month's snapshot is not missed.
-func nextFirstOfMonth(now time.Time) time.Time {
-	year, month, day := now.Date()
-	currentMonthRun := time.Date(year, month, 1, 0, 1, 0, 0, now.Location())
-	if day == 1 && now.Before(currentMonthRun) {
-		return currentMonthRun
-	}
-	return time.Date(year, month+1, 1, 0, 1, 0, 0, now.Location())
-}
-
-// pacificLocation returns the US Pacific timezone.
-func pacificLocation() *time.Location {
-	loc, err := time.LoadLocation("America/Los_Angeles")
-	if err != nil {
-		log.Printf("Warning: cannot load Pacific timezone, using UTC: %v", err)
-		return time.UTC
-	}
-	return loc
-}
-
-// collectSnapshot queries VictoriaMetrics and GitHub, then stores the snapshot.
+// collectSnapshot queries VictoriaMetrics at the end of monthLabel and stores the snapshot.
 func (m *OverviewManager) collectSnapshot(monthLabel string) {
 	log.Printf("Collecting snapshot for %s...", monthLabel)
+
+	// Query at the last moment of the requested month
+	t := parseMonth(monthLabel)
+	queryAt := time.Date(t.Year(), t.Month()+1, 0, 23, 59, 59, 0, time.UTC)
+	// Don't query into the future
+	if queryAt.After(time.Now().UTC()) {
+		queryAt = time.Now().UTC()
+	}
 
 	snapshot := Snapshot{
 		Month:       monthLabel,
@@ -173,7 +144,7 @@ func (m *OverviewManager) collectSnapshot(monthLabel string) {
 	}
 
 	// Query cluster count
-	clusters, err := m.queryScalar(`count(count by (cluster_id) (cozy_cluster_info))`)
+	clusters, err := m.queryScalar(`count(count by (cluster_id) (cozy_cluster_info))`, queryAt)
 	if err != nil {
 		log.Printf("Error querying cluster count: %v", err)
 	} else {
@@ -181,7 +152,7 @@ func (m *OverviewManager) collectSnapshot(monthLabel string) {
 	}
 
 	// Query total nodes
-	nodes, err := m.queryScalar(`sum(cozy_nodes_count)`)
+	nodes, err := m.queryScalar(`sum(cozy_nodes_count)`, queryAt)
 	if err != nil {
 		log.Printf("Error querying total nodes: %v", err)
 	} else {
@@ -189,7 +160,7 @@ func (m *OverviewManager) collectSnapshot(monthLabel string) {
 	}
 
 	// Query total tenants (tenant is an application kind)
-	tenants, err := m.queryScalar(`sum(cozy_application_count{kind="tenant"})`)
+	tenants, err := m.queryScalar(`sum(cozy_application_count{kind="tenant"})`, queryAt)
 	if err != nil {
 		log.Printf("Error querying total tenants: %v", err)
 	} else {
@@ -200,7 +171,7 @@ func (m *OverviewManager) collectSnapshot(monthLabel string) {
 	appList := m.fetchAppList()
 
 	// Query application counts by kind
-	appCounts, err := m.queryVector(`sum by (kind) (cozy_application_count)`)
+	appCounts, err := m.queryVector(`sum by (kind) (cozy_application_count)`, queryAt)
 	if err != nil {
 		log.Printf("Error querying application counts: %v", err)
 	}
@@ -229,7 +200,7 @@ func (m *OverviewManager) collectSnapshot(monthLabel string) {
 
 	// Skip saving if no meaningful data was collected (e.g. VictoriaMetrics was unreachable)
 	if snapshot.Clusters == 0 && snapshot.TotalNodes == 0 && snapshot.TotalTenants == 0 {
-		log.Printf("Snapshot for %s has no data (all zeros), skipping save to avoid overwriting valid data", monthLabel)
+		log.Printf("Snapshot for %s has no data (all zeros), skipping save", monthLabel)
 		return
 	}
 
@@ -244,9 +215,9 @@ type vectorResult struct {
 	Value  float64
 }
 
-// queryScalar executes a PromQL query and returns a single scalar value.
-func (m *OverviewManager) queryScalar(query string) (float64, error) {
-	results, err := m.queryVector(query)
+// queryScalar executes a PromQL query at queryAt and returns a single scalar value.
+func (m *OverviewManager) queryScalar(query string, queryAt time.Time) (float64, error) {
+	results, err := m.queryVector(query, queryAt)
 	if err != nil {
 		return 0, err
 	}
@@ -256,11 +227,12 @@ func (m *OverviewManager) queryScalar(query string) (float64, error) {
 	return results[0].Value, nil
 }
 
-// queryVector executes a PromQL instant query and returns results.
-func (m *OverviewManager) queryVector(query string) ([]vectorResult, error) {
-	queryURL := fmt.Sprintf("%s/select/0/prometheus/api/v1/query?query=%s",
+// queryVector executes a PromQL instant query at queryAt and returns results.
+func (m *OverviewManager) queryVector(query string, queryAt time.Time) ([]vectorResult, error) {
+	queryURL := fmt.Sprintf("%s/select/0/prometheus/api/v1/query?query=%s&time=%d",
 		strings.TrimRight(m.vmSelectURL, "/"),
-		url.QueryEscape(query))
+		url.QueryEscape(query),
+		queryAt.Unix())
 
 	resp, err := m.httpClient.Get(queryURL)
 	if err != nil {
@@ -456,19 +428,58 @@ func (m *OverviewManager) loadSnapshots() {
 }
 
 // HandleOverview serves the /api/overview endpoint.
+// Both year and month query parameters are required to prevent abuse.
+// Example: GET /api/overview?year=2024&month=04
 func (m *OverviewManager) HandleOverview(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
+	yearStr := r.URL.Query().Get("year")
+	monthStr := r.URL.Query().Get("month")
+	if yearStr == "" || monthStr == "" {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintln(w, `{"error":"year and month query parameters are required"}`)
+		return
+	}
+
+	year, err := strconv.Atoi(yearStr)
+	if err != nil || year < 2024 || year > 2100 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintln(w, `{"error":"invalid year parameter"}`)
+		return
+	}
+
+	month, err := strconv.Atoi(monthStr)
+	if err != nil || month < 1 || month > 12 {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		fmt.Fprintln(w, `{"error":"invalid month parameter"}`)
+		return
+	}
+
+	monthLabel := fmt.Sprintf("%04d-%02d", year, month)
+
+	// Ensure snapshot exists (loads from cache or generates on the fly)
+	m.ensureSnapshot(monthLabel)
+
+	// Collect all snapshots up to and including the requested month
 	m.mu.RLock()
-	snapshots := make([]Snapshot, len(m.snapshots))
-	copy(snapshots, m.snapshots)
+	var snapshots []Snapshot
+	for _, s := range m.snapshots {
+		if s.Month <= monthLabel {
+			snapshots = append(snapshots, s)
+		}
+	}
 	m.mu.RUnlock()
 
 	if len(snapshots) == 0 {
-		http.Error(w, "No telemetry data available yet", http.StatusServiceUnavailable)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		fmt.Fprintln(w, `{"error":"no telemetry data available"}`)
 		return
 	}
 
@@ -482,6 +493,7 @@ func (m *OverviewManager) HandleOverview(w http.ResponseWriter, r *http.Request)
 }
 
 // buildOverview constructs the overview response from stored snapshots.
+// snapshots must be sorted descending by month; index 0 is the most recent.
 func (m *OverviewManager) buildOverview(snapshots []Snapshot) OverviewResponse {
 	resp := OverviewResponse{
 		GeneratedAt: snapshots[0].CollectedAt.Format(time.RFC3339),
@@ -512,8 +524,8 @@ func filterSnapshotsByMonths(snapshots []Snapshot, months int) []Snapshot {
 
 	var filtered []Snapshot
 	for _, s := range snapshots {
-		m := parseMonth(s.Month)
-		if !m.Before(cutoff) {
+		t := parseMonth(s.Month)
+		if !t.Before(cutoff) {
 			filtered = append(filtered, s)
 		}
 	}
@@ -610,11 +622,4 @@ func parseMonth(month string) time.Time {
 func roundTo(val float64, places int) float64 {
 	pow := math.Pow(10, float64(places))
 	return math.Round(val*pow) / pow
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

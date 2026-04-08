@@ -155,12 +155,11 @@ func main() {
 
 	// Initialize overview manager
 	overview := NewOverviewManager(*vmSelectURL, *snapshotDir)
-	overview.Start()
 
 	server := &http.Server{
 		Addr:         *listenAddr,
 		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 10 * time.Second,
+		WriteTimeout: 60 * time.Second,
 	}
 
 	http.HandleFunc("/api/overview", overview.HandleOverview)
