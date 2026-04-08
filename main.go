@@ -159,10 +159,16 @@ func main() {
 	server := &http.Server{
 		Addr:         *listenAddr,
 		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 60 * time.Second,
+		WriteTimeout: 10 * time.Second,
 	}
 
-	http.HandleFunc("/api/overview", overview.HandleOverview)
+	// The overview handler may query VictoriaMetrics on cache miss (up to 30s),
+	// so it gets its own 55s timeout instead of inheriting the global 10s WriteTimeout.
+	http.Handle("/api/overview", http.TimeoutHandler(
+		http.HandlerFunc(overview.HandleOverview),
+		55*time.Second,
+		`{"error":"request timeout"}`,
+	))
 	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		handleTelemetry(w, r, *forwardURL)
 	})

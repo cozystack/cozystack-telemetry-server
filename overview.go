@@ -64,6 +64,9 @@ type githubContent struct {
 	Type string `json:"type"`
 }
 
+// maxVMResponseSize caps the VictoriaMetrics response body to prevent OOM on malformed responses.
+const maxVMResponseSize = 10 * 1024 * 1024 // 10 MB
+
 // OverviewManager handles snapshot collection, storage, and serving.
 type OverviewManager struct {
 	vmSelectURL string
@@ -71,6 +74,12 @@ type OverviewManager struct {
 	httpClient  *http.Client
 	mu          sync.RWMutex
 	snapshots   []Snapshot
+
+	// inflightMu + inflight implement per-month singleflight: only one
+	// goroutine generates a snapshot for a given month at a time; others
+	// wait for it to finish instead of firing duplicate VM queries.
+	inflightMu sync.Mutex
+	inflight   map[string]*sync.WaitGroup
 }
 
 // NewOverviewManager creates a new OverviewManager and loads any cached snapshots.
@@ -79,6 +88,7 @@ func NewOverviewManager(vmSelectURL, snapshotDir string) *OverviewManager {
 		vmSelectURL: vmSelectURL,
 		snapshotDir: snapshotDir,
 		httpClient:  &http.Client{Timeout: 30 * time.Second},
+		inflight:    make(map[string]*sync.WaitGroup),
 	}
 	if err := os.MkdirAll(snapshotDir, 0755); err != nil {
 		log.Printf("Warning: cannot create snapshot dir %s: %v", snapshotDir, err)
@@ -89,40 +99,78 @@ func NewOverviewManager(vmSelectURL, snapshotDir string) *OverviewManager {
 
 // ensureSnapshot guarantees the snapshot for monthLabel is in memory.
 // It tries memory first, then disk cache, then generates it from VictoriaMetrics.
+// Concurrent calls for the same month are coalesced: only one goroutine runs
+// the generation and the rest wait for it to complete.
 func (m *OverviewManager) ensureSnapshot(monthLabel string) {
+	if m.hasSnapshot(monthLabel) {
+		return
+	}
+
+	// Try loading from disk cache before querying VM.
+	if m.loadSnapshotFromDisk(monthLabel) {
+		return
+	}
+
+	// Singleflight: only one goroutine generates a given month at a time.
+	m.inflightMu.Lock()
+	if wg, ok := m.inflight[monthLabel]; ok {
+		// Another goroutine is already generating this month — wait for it.
+		m.inflightMu.Unlock()
+		wg.Wait()
+		return
+	}
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	m.inflight[monthLabel] = wg
+	m.inflightMu.Unlock()
+
+	defer func() {
+		m.inflightMu.Lock()
+		delete(m.inflight, monthLabel)
+		m.inflightMu.Unlock()
+		wg.Done()
+	}()
+
+	m.collectSnapshot(monthLabel)
+}
+
+// hasSnapshot reports whether monthLabel is already in the in-memory list.
+func (m *OverviewManager) hasSnapshot(monthLabel string) bool {
 	m.mu.RLock()
+	defer m.mu.RUnlock()
 	for _, s := range m.snapshots {
 		if s.Month == monthLabel {
-			m.mu.RUnlock()
-			return
+			return true
 		}
 	}
-	m.mu.RUnlock()
+	return false
+}
 
-	// Try loading from disk cache (another replica may have written it)
+// loadSnapshotFromDisk tries to read a cached snapshot file for monthLabel.
+// Returns true if the snapshot was found and loaded into memory.
+func (m *OverviewManager) loadSnapshotFromDisk(monthLabel string) bool {
 	filename := filepath.Join(m.snapshotDir, monthLabel+".json")
-	if data, err := os.ReadFile(filename); err == nil {
-		var s Snapshot
-		if json.Unmarshal(data, &s) == nil {
-			m.mu.Lock()
-			// Double-check under write lock
-			for _, existing := range m.snapshots {
-				if existing.Month == monthLabel {
-					m.mu.Unlock()
-					return
-				}
-			}
-			m.snapshots = append(m.snapshots, s)
-			sort.Slice(m.snapshots, func(i, j int) bool {
-				return m.snapshots[i].Month > m.snapshots[j].Month
-			})
-			m.mu.Unlock()
-			return
+	data, err := os.ReadFile(filename)
+	if err != nil {
+		return false
+	}
+	var s Snapshot
+	if err := json.Unmarshal(data, &s); err != nil {
+		return false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// Double-check under write lock in case another goroutine already loaded it.
+	for _, existing := range m.snapshots {
+		if existing.Month == monthLabel {
+			return true
 		}
 	}
-
-	// Generate from VictoriaMetrics
-	m.collectSnapshot(monthLabel)
+	m.snapshots = append(m.snapshots, s)
+	sort.Slice(m.snapshots, func(i, j int) bool {
+		return m.snapshots[i].Month > m.snapshots[j].Month
+	})
+	return true
 }
 
 // collectSnapshot queries VictoriaMetrics at the end of monthLabel and stores the snapshot.
@@ -240,7 +288,7 @@ func (m *OverviewManager) queryVector(query string, queryAt time.Time) ([]vector
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxVMResponseSize))
 	if err != nil {
 		return nil, fmt.Errorf("reading VM response: %v", err)
 	}
