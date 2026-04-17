@@ -10,14 +10,17 @@ Read more about how telemetry is collected from docs:
 
 ## Public Statistics API
 
-The server exposes a `GET /api/overview` endpoint that returns aggregated usage statistics in JSON format. This data is used by the [Cozystack website](https://cozystack.io/) to display public telemetry on the [Telemetry page](https://cozystack.io/oss-health/telemetry/).
+The server exposes a `GET /api/overview?year=YYYY&month=MM` endpoint that returns aggregated usage statistics in JSON format. This data is used by the [Cozystack website](https://cozystack.io/) to display public telemetry on the [Telemetry page](https://cozystack.io/oss-health/telemetry/).
 
 ### How it works
 
-1. On the **1st of each month at 00:01 Pacific Time**, the server queries VictoriaMetrics for the current state of all reporting clusters and stores a monthly snapshot to disk.
-2. On first startup (if no snapshot exists for the current month), an initial snapshot is collected automatically.
-3. The app list is fetched dynamically from [cozystack/cozystack packages/apps](https://github.com/cozystack/cozystack/tree/main/packages/apps) to ensure newly added applications are always included.
-4. The `/api/overview` endpoint aggregates stored snapshots into three time periods: **last month**, **last quarter** (3 months), and **last 12 months**.
+1. The endpoint requires `year` and `month` query parameters (e.g. `/api/overview?year=2026&month=03`). Requests without them return 400.
+2. On first request for a given month, the server queries VictoriaMetrics at the end of that month, writes a snapshot to `--snapshot-dir`, and caches it in memory. Subsequent requests for the same month are served from cache.
+3. Concurrent requests for the same uncached month are coalesced into a single VictoriaMetrics query (per-month singleflight).
+4. The app list is fetched from [cozystack/cozystack packages/apps](https://github.com/cozystack/cozystack/tree/main/packages/apps) so newly added applications are picked up automatically; a built-in fallback list is used if GitHub is unreachable.
+5. The response aggregates snapshots into three time periods relative to the requested month: **that month**, **last quarter** (3 months), and **last 12 months**.
+
+The snapshot directory is backed by an `emptyDir` volume — cache is per-pod and is rebuilt on restart from VictoriaMetrics on demand.
 
 ### Response format
 
