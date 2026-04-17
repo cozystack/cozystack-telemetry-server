@@ -1,4 +1,4 @@
-replicaCount: 2
+replicaCount: 1
 
 image:
   repository: "ghcr.io/cozystack/cozystack-telemetry-server"
@@ -13,6 +13,8 @@ service:
 config:
   forwardURL: "http://vminsert-cozy-telemetry:8480/insert/0/prometheus/api/v1/import/prometheus"
   listenAddr: ":8081"
+  vmSelectURL: "http://vmselect-cozy-telemetry:8481"
+  snapshotDir: "/data/snapshots"
 
 resources:
   requests:
