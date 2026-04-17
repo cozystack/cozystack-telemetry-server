@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -142,6 +143,11 @@ func handleTelemetry(w http.ResponseWriter, r *http.Request, forwardURL string) 
 	r.Body = http.MaxBytesReader(w, r.Body, maxTelemetryBodySize)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			log.Printf("Request from cluster %s rejected: body exceeded %d bytes limit", clusterID, maxBytesErr.Limit)
+			return
+		}
 		log.Printf("Error reading request body: %v", err)
 		http.Error(w, fmt.Sprintf("Error reading request: %v", err), http.StatusBadRequest)
 		return
