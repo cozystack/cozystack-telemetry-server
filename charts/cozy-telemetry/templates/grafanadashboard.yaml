@@ -350,7 +350,7 @@ spec:
                 "uid": "$datasource"
               },
               "expr": "sum by (os) (cozy_nodes_count{cluster_id=~\"$cluster_id\"})",
-              "legendFormat": "{{os}}",
+              "legendFormat": "{{`{{os}}`}}",
               "refId": "A"
             }
           ],
@@ -437,7 +437,7 @@ spec:
                 "uid": "$datasource"
               },
               "expr": "sum by (kernel) (cozy_nodes_count{cluster_id=~\"$cluster_id\"})",
-              "legendFormat": "{{kernel}}",
+              "legendFormat": "{{`{{kernel}}`}}",
               "refId": "A"
             }
           ],
@@ -524,7 +524,7 @@ spec:
                 "uid": "$datasource"
               },
               "expr": "count by (cozystack_version) (cozy_cluster_info{cluster_id=~\"$cluster_id\"})",
-              "legendFormat": "{{cozystack_version}}",
+              "legendFormat": "{{`{{cozystack_version}}`}}",
               "refId": "A"
             }
           ],
@@ -611,7 +611,7 @@ spec:
                 "uid": "$datasource"
               },
               "expr": "count by (kubernetes_version) (cozy_cluster_info{cluster_id=~\"$cluster_id\"})",
-              "legendFormat": "{{kubernetes_version}}",
+              "legendFormat": "{{`{{kubernetes_version}}`}}",
               "refId": "A"
             }
           ],
@@ -698,7 +698,7 @@ spec:
                 "uid": "$datasource"
               },
               "expr": "sum by (kind) (cozy_application_count{cluster_id=~\"$cluster_id\"})",
-              "legendFormat": "{{kind}}",
+              "legendFormat": "{{`{{kind}}`}}",
               "refId": "A"
             }
           ],
@@ -785,7 +785,7 @@ spec:
                 "uid": "$datasource"
               },
               "expr": "sum by (resource) (cozy_cluster_capacity{cluster_id=~\"$cluster_id\"})",
-              "legendFormat": "{{resource}}",
+              "legendFormat": "{{`{{resource}}`}}",
               "refId": "A"
             }
           ],
@@ -872,7 +872,7 @@ spec:
                 "uid": "$datasource"
               },
               "expr": "sum by (driver) (cozy_pvs_count{cluster_id=~\"$cluster_id\"})",
-              "legendFormat": "{{driver}}",
+              "legendFormat": "{{`{{driver}}`}}",
               "refId": "A"
             }
           ],
@@ -959,7 +959,7 @@ spec:
                 "uid": "$datasource"
               },
               "expr": "sum by (size) (cozy_pvs_count{cluster_id=~\"$cluster_id\"})",
-              "legendFormat": "{{size}}",
+              "legendFormat": "{{`{{size}}`}}",
               "refId": "A"
             }
           ],
