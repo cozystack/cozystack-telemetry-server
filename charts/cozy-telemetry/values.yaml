@@ -2,8 +2,8 @@ replicaCount: 1
 
 image:
   repository: "ghcr.io/cozystack/cozystack-telemetry-server"
-  tag: "v1.1.0"
-  pullPolicy: IfNotPresent
+  tag: "latest"
+  pullPolicy: Always
 
 service:
   type: ClusterIP
