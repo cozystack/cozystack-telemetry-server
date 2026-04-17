@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -103,6 +104,26 @@ func forwardToPrometheus(metrics []byte, forwardURL string) error {
 	return nil
 }
 
+// maxTelemetryBodySize is the maximum accepted size for a telemetry POST body.
+const maxTelemetryBodySize = 10 * 1024 * 1024 // 10 MB
+
+// isValidClusterID accepts only alphanumeric characters, hyphens, underscores,
+// and dots (standard Kubernetes naming). This prevents Prometheus text-format
+// injection via the X-Cluster-ID header (e.g. a value containing '"' or '\n'
+// would corrupt the label output forwarded to VictoriaMetrics).
+func isValidClusterID(s string) bool {
+	if s == "" || len(s) > 253 {
+		return false
+	}
+	for _, c := range s {
+		if !((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.') {
+			return false
+		}
+	}
+	return true
+}
+
 func handleTelemetry(w http.ResponseWriter, r *http.Request, forwardURL string) {
 	startTime := time.Now()
 
@@ -113,14 +134,20 @@ func handleTelemetry(w http.ResponseWriter, r *http.Request, forwardURL string) 
 	}
 
 	clusterID := r.Header.Get("X-Cluster-ID")
-	if clusterID == "" {
-		log.Printf("Request rejected: missing X-Cluster-ID header")
-		http.Error(w, "X-Cluster-ID header is required", http.StatusBadRequest)
+	if !isValidClusterID(clusterID) {
+		log.Printf("Request rejected: invalid or missing X-Cluster-ID header")
+		http.Error(w, "X-Cluster-ID header is required and must contain only alphanumeric characters, hyphens, underscores, or dots", http.StatusBadRequest)
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, maxTelemetryBodySize)
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			log.Printf("Request from cluster %s rejected: body exceeded %d bytes limit", clusterID, maxBytesErr.Limit)
+			return
+		}
 		log.Printf("Error reading request body: %v", err)
 		http.Error(w, fmt.Sprintf("Error reading request: %v", err), http.StatusBadRequest)
 		return
