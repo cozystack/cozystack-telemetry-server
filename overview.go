@@ -97,11 +97,23 @@ func NewOverviewManager(vmSelectURL, snapshotDir string) *OverviewManager {
 	return m
 }
 
-// ensureSnapshot guarantees the snapshot for monthLabel is in memory.
-// It tries memory first, then disk cache, then generates it from VictoriaMetrics.
-// Concurrent calls for the same month are coalesced: only one goroutine runs
-// the generation and the rest wait for it to complete.
+// ensureSnapshot guarantees the snapshot for monthLabel is available in memory.
+//
+// For the current (in-progress) month the snapshot is regenerated from
+// VictoriaMetrics on every call and never persisted to disk — the month is
+// still in flight, so caching would freeze the data.
+//
+// For past months the snapshot is looked up in memory first, then on disk,
+// and only generated via VM when absent. Concurrent calls for the same past
+// month are coalesced by singleflight.
 func (m *OverviewManager) ensureSnapshot(monthLabel string) {
+	if m.isCurrentOrFutureMonth(monthLabel) {
+		// In-progress month: always regenerate. collectSnapshot will choose
+		// in-memory-only storage because the resulting snapshot is non-final.
+		m.collectSnapshot(monthLabel)
+		return
+	}
+
 	if m.hasSnapshot(monthLabel) {
 		return
 	}
@@ -134,6 +146,22 @@ func (m *OverviewManager) ensureSnapshot(monthLabel string) {
 	m.collectSnapshot(monthLabel)
 }
 
+// isCurrentOrFutureMonth reports whether monthLabel refers to the current
+// (in-progress) calendar month or a future month. Past months are final and
+// safe to cache; current and future months are not.
+func (m *OverviewManager) isCurrentOrFutureMonth(monthLabel string) bool {
+	return monthLabel >= time.Now().UTC().Format("2006-01")
+}
+
+// isFinalSnapshot reports whether a snapshot was collected after its month
+// ended — i.e. whether it represents the complete, frozen state of that month
+// rather than an in-progress reading that will still change.
+func isFinalSnapshot(s Snapshot) bool {
+	t := parseMonth(s.Month)
+	endOfMonth := time.Date(t.Year(), t.Month()+1, 0, 23, 59, 59, 0, time.UTC)
+	return !s.CollectedAt.Before(endOfMonth)
+}
+
 // hasSnapshot reports whether monthLabel is already in the in-memory list.
 func (m *OverviewManager) hasSnapshot(monthLabel string) bool {
 	m.mu.RLock()
@@ -148,6 +176,9 @@ func (m *OverviewManager) hasSnapshot(monthLabel string) bool {
 
 // loadSnapshotFromDisk tries to read a cached snapshot file for monthLabel.
 // Returns true if the snapshot was found and loaded into memory.
+//
+// Non-final (in-progress) snapshots are treated as if the file were missing
+// so the caller falls back to regenerating from VictoriaMetrics.
 func (m *OverviewManager) loadSnapshotFromDisk(monthLabel string) bool {
 	filename := filepath.Join(m.snapshotDir, monthLabel+".json")
 	data, err := os.ReadFile(filename)
@@ -156,6 +187,11 @@ func (m *OverviewManager) loadSnapshotFromDisk(monthLabel string) bool {
 	}
 	var s Snapshot
 	if err := json.Unmarshal(data, &s); err != nil {
+		return false
+	}
+	if !isFinalSnapshot(s) {
+		log.Printf("Ignoring non-final snapshot on disk for %s (CollectedAt %s before end of month)",
+			monthLabel, s.CollectedAt.Format(time.RFC3339))
 		return false
 	}
 	m.mu.Lock()
@@ -207,8 +243,8 @@ func (m *OverviewManager) collectSnapshot(monthLabel string) {
 		snapshot.TotalNodes = int(nodes)
 	}
 
-	// Query total tenants (tenant is an application kind)
-	tenants, err := m.queryScalar(`sum(cozy_application_count{kind="tenant"})`, queryAt)
+	// Query total tenants (Tenant is an application kind)
+	tenants, err := m.queryScalar(`sum(cozy_application_count{kind="Tenant"})`, queryAt)
 	if err != nil {
 		log.Printf("Error querying total tenants: %v", err)
 	} else {
@@ -252,10 +288,16 @@ func (m *OverviewManager) collectSnapshot(monthLabel string) {
 		return
 	}
 
-	// Save snapshot
-	m.saveSnapshot(snapshot)
-	log.Printf("Snapshot for %s collected: %d clusters, %d nodes, %d tenants, %d app types",
-		monthLabel, snapshot.Clusters, snapshot.TotalNodes, snapshot.TotalTenants, len(snapshot.Apps))
+	// Only final (end-of-month) snapshots are written to disk. In-progress
+	// snapshots for the current month are held in memory and replaced on each
+	// request, so the API always reflects live VM state.
+	if isFinalSnapshot(snapshot) {
+		m.saveSnapshot(snapshot)
+	} else {
+		m.storeSnapshotInMemory(snapshot)
+	}
+	log.Printf("Snapshot for %s collected: %d clusters, %d nodes, %d tenants, %d app types (final=%t)",
+		monthLabel, snapshot.Clusters, snapshot.TotalNodes, snapshot.TotalTenants, len(snapshot.Apps), isFinalSnapshot(snapshot))
 }
 
 type vectorResult struct {
@@ -417,6 +459,13 @@ func (m *OverviewManager) saveSnapshot(s Snapshot) {
 		return
 	}
 
+	m.storeSnapshotInMemory(s)
+}
+
+// storeSnapshotInMemory inserts or replaces a snapshot in the in-memory list
+// without touching disk. Used both by saveSnapshot (after the disk write) and
+// for non-final current-month snapshots that must not be persisted.
+func (m *OverviewManager) storeSnapshotInMemory(s Snapshot) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
@@ -463,6 +512,11 @@ func (m *OverviewManager) loadSnapshots() {
 		var s Snapshot
 		if err := json.Unmarshal(data, &s); err != nil {
 			log.Printf("Warning: cannot parse snapshot %s: %v", e.Name(), err)
+			continue
+		}
+		if !isFinalSnapshot(s) {
+			log.Printf("Skipping non-final snapshot %s (CollectedAt %s before end of month)",
+				e.Name(), s.CollectedAt.Format(time.RFC3339))
 			continue
 		}
 		m.snapshots = append(m.snapshots, s)
