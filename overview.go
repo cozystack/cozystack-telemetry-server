@@ -103,27 +103,33 @@ func NewOverviewManager(vmSelectURL, snapshotDir string) *OverviewManager {
 // VictoriaMetrics on every call and never persisted to disk — the month is
 // still in flight, so caching would freeze the data.
 //
-// For past months the snapshot is looked up in memory first, then on disk,
-// and only generated via VM when absent. Concurrent calls for the same past
-// month are coalesced by singleflight.
+// For past months a *final* in-memory snapshot is reused; non-final entries
+// (e.g. an in-progress April snapshot that survives the May 1 boundary in a
+// long-running process) are treated as cache misses so the regen path runs
+// and produces a final end-of-month snapshot that overwrites the stale one.
+//
+// Concurrent calls for the same month — current or past — are coalesced by
+// singleflight, so a burst of N parallel requests triggers one VictoriaMetrics
+// fetch, not N.
 func (m *OverviewManager) ensureSnapshot(monthLabel string) {
-	if m.isCurrentOrFutureMonth(monthLabel) {
-		// In-progress month: always regenerate. collectSnapshot will choose
-		// in-memory-only storage because the resulting snapshot is non-final.
-		m.collectSnapshot(monthLabel)
-		return
-	}
+	current := m.isCurrentOrFutureMonth(monthLabel)
 
-	if m.hasSnapshot(monthLabel) {
-		return
-	}
-
-	// Try loading from disk cache before querying VM.
-	if m.loadSnapshotFromDisk(monthLabel) {
-		return
+	if !current {
+		if m.hasFinalSnapshot(monthLabel) {
+			return
+		}
+		// Try loading from disk cache before querying VM. The on-disk file
+		// for a current month is by definition non-final and loadSnapshotFromDisk
+		// would ignore it anyway, so this is only useful for past months.
+		if m.loadSnapshotFromDisk(monthLabel) {
+			return
+		}
 	}
 
 	// Singleflight: only one goroutine generates a given month at a time.
+	// Applies to both current and past months — for the current month, this
+	// lets concurrent /api/overview callers share one VictoriaMetrics fetch
+	// instead of fanning out to N parallel queries.
 	m.inflightMu.Lock()
 	if wg, ok := m.inflight[monthLabel]; ok {
 		// Another goroutine is already generating this month — wait for it.
@@ -162,12 +168,14 @@ func isFinalSnapshot(s Snapshot) bool {
 	return !s.CollectedAt.Before(endOfMonth)
 }
 
-// hasSnapshot reports whether monthLabel is already in the in-memory list.
-func (m *OverviewManager) hasSnapshot(monthLabel string) bool {
+// hasFinalSnapshot reports whether a final snapshot for monthLabel — one
+// collected after the month ended — is already in the in-memory list. Non-final
+// entries do not count: see ensureSnapshot for why.
+func (m *OverviewManager) hasFinalSnapshot(monthLabel string) bool {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	for _, s := range m.snapshots {
-		if s.Month == monthLabel {
+		if s.Month == monthLabel && isFinalSnapshot(s) {
 			return true
 		}
 	}
