@@ -8,7 +8,6 @@ import (
 	"io"
 	"log"
 	"net/http"
-	"sort"
 	"strings"
 	"time"
 
@@ -18,7 +17,7 @@ import (
 
 func enrichMetrics(input []byte, clusterID string) ([]byte, error) {
 	symbolTable := labels.NewSymbolTable()
-	parser := textparse.NewPromParser(input, symbolTable)
+	parser := textparse.NewPromParser(input, symbolTable, false)
 	var builder bytes.Buffer
 
 	metricsCount := 0
@@ -45,32 +44,21 @@ func enrichMetrics(input []byte, clusterID string) ([]byte, error) {
 			_, _, value := parser.Series()
 
 			var lbls labels.Labels
-			parser.Metric(&lbls)
+			parser.Labels(&lbls)
 
-			// Add cluster_id to the labels
-			lbls = append(lbls,
-				labels.Label{
-					Name:  "cluster_id",
-					Value: clusterID,
-				},
-			)
+			// Add cluster_id to the labels; Builder.Labels() returns them sorted.
+			// clusterID is always non-empty in the request path (isValidClusterID
+			// gates the handler); an empty value would be dropped by Builder.Set.
+			lbls = labels.NewBuilder(lbls).Set("cluster_id", clusterID).Labels()
 
-			sort.Sort(lbls)
-
-			metricName := ""
-			for _, lbl := range lbls {
-				if lbl.Name == "__name__" {
-					metricName = lbl.Value
-					break
-				}
-			}
+			metricName := lbls.Get("__name__")
 
 			var labelStrings []string
-			for _, lbl := range lbls {
+			lbls.Range(func(lbl labels.Label) {
 				if lbl.Name != "__name__" {
 					labelStrings = append(labelStrings, fmt.Sprintf("%s=\"%s\"", lbl.Name, lbl.Value))
 				}
-			}
+			})
 
 			labelsStr := ""
 			if len(labelStrings) > 0 {
