@@ -229,22 +229,36 @@ func (m *OverviewManager) collectSnapshot(monthLabel string) {
 		queryAt = time.Now().UTC()
 	}
 
+	// Lookback window covering the month from its first day up to queryAt. An
+	// instant query alone only sees series that are non-stale at queryAt (~5m
+	// staleness), so it counts only the clusters that happened to report in the
+	// last few minutes — roughly a third of the fleet. Telemetry clients report
+	// periodically, so we wrap each selector in max_over_time(<selector>[window])
+	// to count every series that reported at least once during the month. This
+	// matches the Grafana telemetry-overview dashboard, whose stat panels run
+	// range queries over the period instead of a single instant.
+	windowSec := int(queryAt.Sub(t).Seconds())
+	if windowSec < 300 {
+		windowSec = 300
+	}
+	window := fmt.Sprintf("%ds", windowSec)
+
 	snapshot := Snapshot{
 		Month:       monthLabel,
 		CollectedAt: time.Now().UTC(),
 		Apps:        make(map[string]int),
 	}
 
-	// Query cluster count
-	clusters, err := m.queryScalar(`count(count by (cluster_id) (cozy_cluster_info))`, queryAt)
+	// Query cluster count: clusters that reported at least once during the month.
+	clusters, err := m.queryScalar(fmt.Sprintf(`count(count by (cluster_id) (max_over_time(cozy_cluster_info[%s])))`, window), queryAt)
 	if err != nil {
 		log.Printf("Error querying cluster count: %v", err)
 	} else {
 		snapshot.Clusters = int(clusters)
 	}
 
-	// Query total nodes
-	nodes, err := m.queryScalar(`sum(cozy_nodes_count)`, queryAt)
+	// Query total nodes: peak node count per cluster over the month, summed.
+	nodes, err := m.queryScalar(fmt.Sprintf(`sum(max_over_time(cozy_nodes_count[%s]))`, window), queryAt)
 	if err != nil {
 		log.Printf("Error querying total nodes: %v", err)
 	} else {
@@ -252,7 +266,7 @@ func (m *OverviewManager) collectSnapshot(monthLabel string) {
 	}
 
 	// Query total tenants (Tenant is an application kind)
-	tenants, err := m.queryScalar(`sum(cozy_application_count{kind="Tenant"})`, queryAt)
+	tenants, err := m.queryScalar(fmt.Sprintf(`sum(max_over_time(cozy_application_count{kind="Tenant"}[%s]))`, window), queryAt)
 	if err != nil {
 		log.Printf("Error querying total tenants: %v", err)
 	} else {
@@ -263,7 +277,7 @@ func (m *OverviewManager) collectSnapshot(monthLabel string) {
 	appList := m.fetchAppList()
 
 	// Query application counts by kind
-	appCounts, err := m.queryVector(`sum by (kind) (cozy_application_count)`, queryAt)
+	appCounts, err := m.queryVector(fmt.Sprintf(`sum by (kind) (max_over_time(cozy_application_count[%s]))`, window), queryAt)
 	if err != nil {
 		log.Printf("Error querying application counts: %v", err)
 	}
