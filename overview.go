@@ -616,120 +616,99 @@ func (m *OverviewManager) HandleOverview(w http.ResponseWriter, r *http.Request)
 	}
 }
 
-// buildOverview constructs the overview response from stored snapshots.
+// buildOverview constructs the overview response.
+//
+// The month period is taken from the cached/just-collected monthly snapshot.
+// The quarter and year periods are queried live over their own windows (3 and
+// 12 calendar months ending at the same instant), because a cumulative count
+// of distinct clusters over a multi-month window cannot be derived by averaging
+// per-month snapshots: a cluster active in two months must be counted once, not
+// twice, and averaging would understate the period total. The app breakdown for
+// the longer periods reuses the month's, to avoid transient load-test spikes
+// inflating the quarter/year peak (max_over_time captures one-off bursts).
+//
 // snapshots must be sorted descending by month; index 0 is the most recent.
 func (m *OverviewManager) buildOverview(snapshots []Snapshot) OverviewResponse {
+	latest := snapshots[0]
 	resp := OverviewResponse{
-		GeneratedAt: snapshots[0].CollectedAt.Format(time.RFC3339),
+		GeneratedAt: latest.CollectedAt.Format(time.RFC3339),
 		Periods:     make(map[string]PeriodStats),
 	}
 
-	// Month: latest snapshot
-	resp.Periods["month"] = aggregateSnapshots(snapshots[:1], false)
+	monthStart := parseMonth(latest.Month)
+	// Same instant the snapshot was queried at: end of its month, clamped to now.
+	queryAt := monthStart.AddDate(0, 1, 0).Add(-time.Second)
+	if now := time.Now().UTC(); queryAt.After(now) {
+		queryAt = now
+	}
 
-	// Quarter: last 3 calendar months
-	resp.Periods["quarter"] = aggregateSnapshots(filterSnapshotsByMonths(snapshots, 3), true)
+	// Month: distinct/peak over the calendar month, straight from the snapshot.
+	month := PeriodStats{
+		Label:        monthStart.Format("January 2006"),
+		Start:        monthStart.Format("2006-01-02"),
+		End:          monthStart.AddDate(0, 1, -1).Format("2006-01-02"),
+		Clusters:     latest.Clusters,
+		TotalNodes:   latest.TotalNodes,
+		TotalTenants: latest.TotalTenants,
+		Apps:         latest.Apps,
+	}
+	if latest.Clusters > 0 {
+		month.AvgNodesPerCluster = roundTo(float64(latest.TotalNodes)/float64(latest.Clusters), 1)
+		month.AvgTenantsPerCluster = roundTo(float64(latest.TotalTenants)/float64(latest.Clusters), 1)
+	}
+	resp.Periods["month"] = month
 
-	// Year: last 12 calendar months
-	resp.Periods["year"] = aggregateSnapshots(filterSnapshotsByMonths(snapshots, 12), true)
+	quarterStart := monthStart.AddDate(0, -2, 0)
+	resp.Periods["quarter"] = m.periodStats(
+		fmt.Sprintf("%s \u2014 %s", quarterStart.Format("January 2006"), monthStart.Format("January 2006")),
+		quarterStart, queryAt, latest.Apps)
+
+	yearStart := monthStart.AddDate(0, -11, 0)
+	resp.Periods["year"] = m.periodStats(
+		fmt.Sprintf("%s \u2014 %s", yearStart.Format("January 2006"), monthStart.Format("January 2006")),
+		yearStart, queryAt, latest.Apps)
 
 	return resp
 }
 
-// filterSnapshotsByMonths returns snapshots within the last N calendar months
-// relative to the latest snapshot. This ensures correct ranges even with gaps.
-func filterSnapshotsByMonths(snapshots []Snapshot, months int) []Snapshot {
-	if len(snapshots) == 0 {
-		return nil
+// periodStats runs windowed VictoriaMetrics queries over [start, end] and
+// returns aggregated stats for the period. Clusters/nodes/tenants are counted
+// over the whole window via max_over_time, so every entity active at any point
+// during the period is included (see collectSnapshot for why an instant query
+// undercounts). The app breakdown is supplied by the caller.
+func (m *OverviewManager) periodStats(label string, start, end time.Time, apps map[string]int) PeriodStats {
+	windowSec := int(end.Sub(start).Seconds())
+	if windowSec < 300 {
+		windowSec = 300
 	}
-
-	latest := parseMonth(snapshots[0].Month)
-	cutoff := latest.AddDate(0, -(months - 1), 0)
-
-	var filtered []Snapshot
-	for _, s := range snapshots {
-		t := parseMonth(s.Month)
-		if !t.Before(cutoff) {
-			filtered = append(filtered, s)
-		}
-	}
-	return filtered
-}
-
-// aggregateSnapshots computes stats from a list of snapshots.
-// If avg is true, it computes averages; otherwise uses the single snapshot values.
-func aggregateSnapshots(snapshots []Snapshot, avg bool) PeriodStats {
-	if len(snapshots) == 0 {
-		return PeriodStats{}
-	}
-
-	// Snapshots are sorted descending by month. The latest is first.
-	latest := snapshots[0]
-	oldest := snapshots[len(snapshots)-1]
+	window := fmt.Sprintf("%ds", windowSec)
 
 	stats := PeriodStats{
-		Apps: make(map[string]int),
+		Label: label,
+		Start: start.Format("2006-01-02"),
+		End:   end.Format("2006-01-02"),
+		Apps:  apps,
 	}
 
-	// Build label and date range
-	latestDate := parseMonth(latest.Month)
-	oldestDate := parseMonth(oldest.Month)
-
-	if len(snapshots) == 1 {
-		stats.Label = latestDate.Format("January 2006")
-		stats.Start = latestDate.Format("2006-01-02")
-		endOfMonth := latestDate.AddDate(0, 1, -1)
-		stats.End = endOfMonth.Format("2006-01-02")
+	if clusters, err := m.queryScalar(fmt.Sprintf(`count(count by (cluster_id) (max_over_time(cozy_cluster_info[%s])))`, window), end); err != nil {
+		log.Printf("Error querying %s cluster count: %v", label, err)
 	} else {
-		stats.Label = fmt.Sprintf("%s \u2014 %s",
-			oldestDate.Format("January 2006"),
-			latestDate.Format("January 2006"))
-		stats.Start = oldestDate.Format("2006-01-02")
-		endOfMonth := latestDate.AddDate(0, 1, -1)
-		stats.End = endOfMonth.Format("2006-01-02")
+		stats.Clusters = int(clusters)
 	}
-
-	if !avg || len(snapshots) == 1 {
-		// Use the latest snapshot directly
-		stats.Clusters = latest.Clusters
-		stats.TotalNodes = latest.TotalNodes
-		stats.TotalTenants = latest.TotalTenants
-		if latest.Clusters > 0 {
-			stats.AvgNodesPerCluster = roundTo(float64(latest.TotalNodes)/float64(latest.Clusters), 1)
-			stats.AvgTenantsPerCluster = roundTo(float64(latest.TotalTenants)/float64(latest.Clusters), 1)
-		}
-		for k, v := range latest.Apps {
-			stats.Apps[k] = v
-		}
-		return stats
+	if nodes, err := m.queryScalar(fmt.Sprintf(`sum(max_over_time(cozy_nodes_count[%s]))`, window), end); err != nil {
+		log.Printf("Error querying %s node count: %v", label, err)
+	} else {
+		stats.TotalNodes = int(nodes)
 	}
-
-	// Average across snapshots
-	n := float64(len(snapshots))
-	var totalClusters, totalNodes, totalTenants float64
-	appTotals := make(map[string]float64)
-
-	for _, s := range snapshots {
-		totalClusters += float64(s.Clusters)
-		totalNodes += float64(s.TotalNodes)
-		totalTenants += float64(s.TotalTenants)
-		for k, v := range s.Apps {
-			appTotals[k] += float64(v)
-		}
+	if tenants, err := m.queryScalar(fmt.Sprintf(`sum(max_over_time(cozy_application_count{kind="Tenant"}[%s]))`, window), end); err != nil {
+		log.Printf("Error querying %s tenant count: %v", label, err)
+	} else {
+		stats.TotalTenants = int(tenants)
 	}
-
-	stats.Clusters = int(math.Round(totalClusters / n))
-	stats.TotalNodes = int(math.Round(totalNodes / n))
-	stats.TotalTenants = int(math.Round(totalTenants / n))
 	if stats.Clusters > 0 {
 		stats.AvgNodesPerCluster = roundTo(float64(stats.TotalNodes)/float64(stats.Clusters), 1)
 		stats.AvgTenantsPerCluster = roundTo(float64(stats.TotalTenants)/float64(stats.Clusters), 1)
 	}
-
-	for k, v := range appTotals {
-		stats.Apps[k] = int(math.Round(v / n))
-	}
-
 	return stats
 }
 
