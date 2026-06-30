@@ -67,6 +67,18 @@ type githubContent struct {
 // maxVMResponseSize caps the VictoriaMetrics response body to prevent OOM on malformed responses.
 const maxVMResponseSize = 10 * 1024 * 1024 // 10 MB
 
+// currentMonthPeriodTTL is how long quarter/year period stats for the current
+// month are reused before being recomputed. Past months are final and cached
+// indefinitely; only the in-progress month needs periodic refreshing.
+const currentMonthPeriodTTL = 5 * time.Minute
+
+// periodCacheEntry holds the computed quarter/year stats for a requested month.
+type periodCacheEntry struct {
+	quarter   PeriodStats
+	year      PeriodStats
+	expiresAt time.Time
+}
+
 // OverviewManager handles snapshot collection, storage, and serving.
 type OverviewManager struct {
 	vmSelectURL string
@@ -80,15 +92,25 @@ type OverviewManager struct {
 	// wait for it to finish instead of firing duplicate VM queries.
 	inflightMu sync.Mutex
 	inflight   map[string]*sync.WaitGroup
+
+	// periodCache memoizes the expensive windowed quarter/year queries per
+	// requested month; periodInflight coalesces concurrent callers the same
+	// way inflight does for snapshots. See periodsFor for the freshness rules.
+	periodMu         sync.RWMutex
+	periodCache      map[string]periodCacheEntry
+	periodInflightMu sync.Mutex
+	periodInflight   map[string]*sync.WaitGroup
 }
 
 // NewOverviewManager creates a new OverviewManager and loads any cached snapshots.
 func NewOverviewManager(vmSelectURL, snapshotDir string) *OverviewManager {
 	m := &OverviewManager{
-		vmSelectURL: vmSelectURL,
-		snapshotDir: snapshotDir,
-		httpClient:  &http.Client{Timeout: 30 * time.Second},
-		inflight:    make(map[string]*sync.WaitGroup),
+		vmSelectURL:    vmSelectURL,
+		snapshotDir:    snapshotDir,
+		httpClient:     &http.Client{Timeout: 30 * time.Second},
+		inflight:       make(map[string]*sync.WaitGroup),
+		periodCache:    make(map[string]periodCacheEntry),
+		periodInflight: make(map[string]*sync.WaitGroup),
 	}
 	if err := os.MkdirAll(snapshotDir, 0755); err != nil {
 		log.Printf("Warning: cannot create snapshot dir %s: %v", snapshotDir, err)
@@ -658,17 +680,76 @@ func (m *OverviewManager) buildOverview(snapshots []Snapshot) OverviewResponse {
 	}
 	resp.Periods["month"] = month
 
-	quarterStart := monthStart.AddDate(0, -2, 0)
-	resp.Periods["quarter"] = m.periodStats(
-		fmt.Sprintf("%s \u2014 %s", quarterStart.Format("January 2006"), monthStart.Format("January 2006")),
-		quarterStart, queryAt, latest.Apps)
-
-	yearStart := monthStart.AddDate(0, -11, 0)
-	resp.Periods["year"] = m.periodStats(
-		fmt.Sprintf("%s \u2014 %s", yearStart.Format("January 2006"), monthStart.Format("January 2006")),
-		yearStart, queryAt, latest.Apps)
+	quarter, year := m.periodsFor(latest.Month, monthStart, queryAt, latest.Apps)
+	resp.Periods["quarter"] = quarter
+	resp.Periods["year"] = year
 
 	return resp
+}
+
+// periodsFor returns the quarter and year PeriodStats for the requested month,
+// reusing a memoized result when one is available. The windowed max_over_time
+// queries that back these periods are expensive (the year alone is a 365d scan
+// over the whole fleet), so running them on every request would amplify a cheap
+// public GET into a heavy VictoriaMetrics load. A past month is final and cached
+// indefinitely; the in-progress month is cached for a short TTL. Concurrent
+// callers for the same month are coalesced via singleflight, mirroring how
+// snapshot collection is coalesced.
+func (m *OverviewManager) periodsFor(monthLabel string, monthStart, queryAt time.Time, apps map[string]int) (PeriodStats, PeriodStats) {
+	for {
+		m.periodMu.RLock()
+		entry, ok := m.periodCache[monthLabel]
+		m.periodMu.RUnlock()
+		if ok && time.Now().UTC().Before(entry.expiresAt) {
+			return entry.quarter, entry.year
+		}
+
+		// Singleflight: only one goroutine computes a given month at a time.
+		m.periodInflightMu.Lock()
+		if wg, inflight := m.periodInflight[monthLabel]; inflight {
+			m.periodInflightMu.Unlock()
+			wg.Wait()
+			continue // winner populated the cache; re-check it
+		}
+		wg := &sync.WaitGroup{}
+		wg.Add(1)
+		m.periodInflight[monthLabel] = wg
+		m.periodInflightMu.Unlock()
+
+		return m.computeAndCachePeriods(monthLabel, monthStart, queryAt, apps, wg)
+	}
+}
+
+// computeAndCachePeriods runs the windowed quarter/year queries, stores the
+// result in periodCache and releases the singleflight slot. It is only ever
+// called by the goroutine that won the singleflight in periodsFor.
+func (m *OverviewManager) computeAndCachePeriods(monthLabel string, monthStart, queryAt time.Time, apps map[string]int, wg *sync.WaitGroup) (PeriodStats, PeriodStats) {
+	defer func() {
+		m.periodInflightMu.Lock()
+		delete(m.periodInflight, monthLabel)
+		m.periodInflightMu.Unlock()
+		wg.Done()
+	}()
+
+	quarterStart := monthStart.AddDate(0, -2, 0)
+	quarter := m.periodStats(
+		fmt.Sprintf("%s \u2014 %s", quarterStart.Format("January 2006"), monthStart.Format("January 2006")),
+		quarterStart, queryAt, apps)
+
+	yearStart := monthStart.AddDate(0, -11, 0)
+	year := m.periodStats(
+		fmt.Sprintf("%s \u2014 %s", yearStart.Format("January 2006"), monthStart.Format("January 2006")),
+		yearStart, queryAt, apps)
+
+	expiresAt := time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC)
+	if m.isCurrentOrFutureMonth(monthLabel) {
+		expiresAt = time.Now().UTC().Add(currentMonthPeriodTTL)
+	}
+	m.periodMu.Lock()
+	m.periodCache[monthLabel] = periodCacheEntry{quarter: quarter, year: year, expiresAt: expiresAt}
+	m.periodMu.Unlock()
+
+	return quarter, year
 }
 
 // periodStats runs windowed VictoriaMetrics queries over [start, end] and
