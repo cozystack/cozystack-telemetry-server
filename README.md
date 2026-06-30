@@ -15,10 +15,10 @@ The server exposes a `GET /api/overview?year=YYYY&month=MM` endpoint that return
 ### How it works
 
 1. The endpoint requires `year` and `month` query parameters (e.g. `/api/overview?year=2026&month=03`). Requests without them return 400.
-2. On first request for a given month, the server queries VictoriaMetrics at the end of that month, writes a snapshot to `--snapshot-dir`, and caches it in memory. Subsequent requests for the same month are served from cache.
+2. On first request for a given month, the server queries VictoriaMetrics over a window spanning that month, writes a snapshot to `--snapshot-dir`, and caches it in memory. Subsequent requests for the same month are served from cache. Counts use `max_over_time(<selector>[window])` rather than an instant query, so a snapshot reflects every cluster/node/tenant/app that reported at least once during the month — an instant query only sees series that are non-stale at a single timestamp (~5m) and undercounts the active fleet ~3x.
 3. Concurrent requests for the same uncached month are coalesced into a single VictoriaMetrics query (per-month singleflight).
 4. The app list is fetched from [cozystack/cozystack packages/apps](https://github.com/cozystack/cozystack/tree/main/packages/apps) so newly added applications are picked up automatically; a built-in fallback list is used if GitHub is unreachable.
-5. The response aggregates snapshots into three time periods relative to the requested month: **that month**, **last quarter** (3 months), and **last 12 months**.
+5. The response reports three time periods relative to the requested month: **that month**, **last quarter** (3 calendar months) and **last 12 months**. The quarter and year are queried live over their own windows — a cumulative count of distinct clusters over several months cannot be derived by averaging per-month snapshots (a cluster active in two months must be counted once). Their app breakdown reuses the month's, to avoid one-off load-test spikes inflating the longer-window peak. The quarter/year results are memoized per requested month (past months indefinitely, the current month for a short TTL) and concurrent callers are coalesced via singleflight, so repeated requests do not re-run the heavy windowed queries.
 
 The snapshot directory is backed by an `emptyDir` volume — cache is per-pod and is rebuilt on restart from VictoriaMetrics on demand.
 
@@ -43,8 +43,8 @@ The snapshot directory is backed by an `emptyDir` volume — cache is per-pod an
         "kubernetes": 30
       }
     },
-    "quarter": { "..." : "averaged over 3 months" },
-    "year": { "..." : "averaged over 12 months" }
+    "quarter": { "..." : "distinct over the last 3 calendar months" },
+    "year": { "..." : "distinct over the last 12 calendar months" }
   }
 }
 ```
