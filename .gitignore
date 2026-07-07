@@ -1,0 +1,3 @@
+# Compiled binaries (module name and Dockerfile output name)
+/cozystack-telemetry-server
+/cozy-telemetry-server
